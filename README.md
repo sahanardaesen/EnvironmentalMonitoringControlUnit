@@ -1,6 +1,3 @@
-# EnvironmentalMonitoringControlUnit
-STM32-based environmental monitoring and control unit using ADC, UART and GPIO peripherals.
-
 # Environmental Monitoring Control Unit
 
 STM32F103C8T6 based embedded systems project.
