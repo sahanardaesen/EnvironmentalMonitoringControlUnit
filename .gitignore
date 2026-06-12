@@ -1,0 +1,41 @@
+# STM32CubeIDE / Eclipse build artifacts
+Debug/
+Release/
+build/
+
+# Eclipse project files (optional — include these if sharing with others)
+.project
+.cproject
+.settings/
+
+# STM32CubeIDE generated files you may want to regenerate locally
+*.launch
+*.map
+*.elf
+*.bin
+*.hex
+*.list
+*.su
+
+# Dependency files
+*.d
+
+# Preprocessed files
+*.i
+*.s
+
+# Object files
+*.o
+*.a
+
+# Linker output
+*.out
+
+# CubeMX backup files
+*.bak
+*.orig
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
