@@ -12,8 +12,8 @@ STM32F103C8T6 based embedded systems project.
 
 ## Commands
 
-LED ON
-LED OFF
+- LED ON
+- LED OFF
 
 ## Hardware
 
