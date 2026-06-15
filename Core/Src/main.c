@@ -2,17 +2,12 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
+  * @brief          : UART komut tablosu (dispatch table) mimarisi
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * Yeni komut eklemek için:
+  * 1. Handler fonksiyonunu yaz  (örn: void Cmd_LedBlink(void))
+  * 2. command_table[] dizisine bir satır ekle
+  * Başka hiçbir yere dokunmana gerek yok.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -21,17 +16,28 @@
 #include "adc.h"
 #include "usart.h"
 #include "gpio.h"
-#include <string.h>
-#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+typedef enum {
+    MODE_UART,
+    MODE_BUTTON,
+    MODE_ADC
+} SystemMode_t;
 
+#define CMDFLAG_ANY  (-1)
+
+typedef struct {
+    const char   *name;          /* UART'tan beklenen string, ör. "LEDON" */
+    int           allowed_mode;  /* hangi modda aktif, ya da CMDFLAG_ANY   */
+    void        (*handler)(void);/* çağrılacak fonksiyon                   */
+} Command_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -48,28 +54,51 @@
 
 /* USER CODE BEGIN PV */
 volatile uint8_t button_pressed_flag = 0;
-uint32_t last_button_time = 0;
+uint32_t         last_button_time    = 0;
 
-uint8_t rx_byte;
-char command[20];
-uint8_t cmd_index = 0;
+uint8_t  rx_byte       = 0;
+char     command[32]   = {0};
+uint8_t  cmd_index     = 0;
 volatile uint8_t command_ready = 0;
 
-uint16_t adcValue;
-char msg[50];
+uint16_t adcValue = 0;
+char     msg[64]  = {0};
+
+SystemMode_t currentMode = MODE_UART;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-void Pot_ile_Deger_Olcme(void);
-void Buton_ile_LED_Degistirme(void);
-void Sistem_Kontrol(void);
+/* Mod görev fonksiyonları */
+static void Uart_Mode_Task(void);
+static void Button_Mode_Task(void);
+static void Adc_Mode_Task(void);
+
+/* Komut handler'ları — her biri tabloya bağlanır */
+static void Cmd_SetModeUart(void);
+static void Cmd_SetModeButton(void);
+static void Cmd_SetModeAdc(void);
+static void Cmd_LedOn(void);
+static void Cmd_LedOff(void);
+
+/* Dispatch motoru */
+static void Process_Command(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* ── KOMUT TABLOSU ────────────────────────────────────────────────────────── */
+static const Command_t command_table[] = {
+    /* isim     mod izni        handler         */
+    { "UART",    CMDFLAG_ANY,    Cmd_SetModeUart   },
+    { "BUTTON",  CMDFLAG_ANY,    Cmd_SetModeButton },
+    { "ADC",     CMDFLAG_ANY,    Cmd_SetModeAdc    },
+    { "LEDON",   MODE_UART,      Cmd_LedOn         },
+    { "LEDOFF",  MODE_UART,      Cmd_LedOff        },
+};
 
+#define COMMAND_TABLE_SIZE  (sizeof(command_table) / sizeof(command_table[0]))
 /* USER CODE END 0 */
 
 /**
@@ -104,7 +133,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Transmit(&huart1, (uint8_t*)"ADC START\r\n", 12, 100);
+  HAL_UART_Transmit(&huart1, (uint8_t *)"System ready\r\n", 14, 100);
   HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
   /* USER CODE END 2 */
 
@@ -112,16 +141,26 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    /* Önce: yeni UART komutu geldiyse işle */
+    if (command_ready)
+    {
+        Process_Command();
+        command_ready = 0;
+        memset(command, 0, sizeof(command));
+    }
+
+    /* Sonra: aktif moda ait görevi çalıştır */
+    switch (currentMode)
+    {
+        case MODE_UART:   Uart_Mode_Task();   break;
+        case MODE_BUTTON: Button_Mode_Task(); break;
+        case MODE_ADC:    Adc_Mode_Task();    break;
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if(command_ready == 1){
-		  Sistem_Kontrol();
-		  command_ready = 0;
-          memset(command, 0, sizeof(command));
-	  }
-  /* USER CODE END 3 */
   }
+  /* USER CODE END 3 */
 }
 
 /**
@@ -171,70 +210,126 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-/*void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+/* ── Dispatch motoru ──────────────────────────────────────────────────────── */
+static void Process_Command(void)
 {
-    // Kesme bizim butonun bağlı olduğu PA0 pininden mi geldi?
-    if(GPIO_Pin == GPIO_PIN_0)
+    for (uint8_t i = 0; i < COMMAND_TABLE_SIZE; i++)
     {
-        // Debounce (Gürültü Engelleme): Eğer son basılmadan sonra 200 milisaniye geçmediyse gürültü kabul et, geçtiyse basım algıla
-        if((HAL_GetTick() - last_button_time) > 200)
+        if (strcmp(command, command_table[i].name) == 0)
         {
-            button_pressed_flag = 1;          // Ana döngüye (while) butonun basıldığını haber ver
-            last_button_time = HAL_GetTick(); // Son başarılı basılma zamanını güncelle
+            /* Mod kısıtlaması var mı? */
+            if (command_table[i].allowed_mode != CMDFLAG_ANY &&
+                command_table[i].allowed_mode != (int)currentMode)
+            {
+                HAL_UART_Transmit(&huart1,
+                    (uint8_t *)"Command not available in this mode\r\n", 36, 100);
+                return;
+            }
+
+            /* Handler'ı çalıştır */
+            command_table[i].handler();
+            return;
         }
     }
-}*/
+
+    /* Hiç eşleşme bulunamadı */
+    HAL_UART_Transmit(&huart1, (uint8_t *)"Unknown command\r\n", 17, 100);
+}
+
+/* ── Komut handler'ları ───────────────────────────────────────────────────── */
+static void Cmd_SetModeUart(void)
+{
+    currentMode = MODE_UART;
+    HAL_UART_Transmit(&huart1, (uint8_t *)"UART MODE\r\n", 11, 100);
+}
+
+static void Cmd_SetModeButton(void)
+{
+    currentMode = MODE_BUTTON;
+    HAL_UART_Transmit(&huart1, (uint8_t *)"BUTTON MODE\r\n", 13, 100);
+}
+
+static void Cmd_SetModeAdc(void)
+{
+    currentMode = MODE_ADC;
+    HAL_UART_Transmit(&huart1, (uint8_t *)"ADC MODE\r\n", 10, 100);
+}
+
+static void Cmd_LedOn(void)
+{
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET); /* aktif-low LED */
+    HAL_UART_Transmit(&huart1, (uint8_t *)"LED ON\r\n", 8, 100);
+}
+
+static void Cmd_LedOff(void)
+{
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    HAL_UART_Transmit(&huart1, (uint8_t *)"LED OFF\r\n", 9, 100);
+}
+
+/* ── Mod görev fonksiyonları ──────────────────────────────────────────────── */
+static void Uart_Mode_Task(void)
+{
+    /* Mod periyodik işleri buraya yazılabilir */
+}
+
+static void Button_Mode_Task(void)
+{
+    if (button_pressed_flag)
+    {
+        button_pressed_flag = 0;
+        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    }
+}
+
+static void Adc_Mode_Task(void)
+{
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, 100);
+    adcValue = HAL_ADC_GetValue(&hadc1);
+
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13,
+                      (adcValue < 2048) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+    sprintf(msg, "ADC: %u\r\n", adcValue);
+    HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), 100);
+}
+
+/* ── Interrupt callback'leri ──────────────────────────────────────────────── */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_0)
+    {
+        if ((HAL_GetTick() - last_button_time) > 200)
+        {
+            button_pressed_flag = 1;
+            last_button_time    = HAL_GetTick();
+        }
+    }
+}
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if(huart->Instance == USART1)
+    if (huart->Instance != USART1) return;
+
+    if (rx_byte != '\n' && rx_byte != '\r')
     {
-        if(rx_byte != '\n' && rx_byte != '\r')
+        if (cmd_index < sizeof(command) - 1)   /* taşma koruması */
         {
-            command[cmd_index] = rx_byte;
-            cmd_index++;
+            command[cmd_index++] = rx_byte;
         }
-        else
-        {
-            command[cmd_index] = '\0';
-            command_ready = 1;
-            cmd_index = 0;
-        }
-        HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     }
-}
+    else
+    {
+        command[cmd_index] = '\0';
+        if (cmd_index > 0)                     /* boş satırı yoksay */
+        {
+            command_ready = 1;
+        }
+        cmd_index = 0;
+    }
 
-void Sistem_Kontrol(void){
-	if(strcmp(command, "LED ON") == 0){
-		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
-	}
-	else if(strcmp(command, "LED OFF") == 0){
-		HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-	}
-}
-
-void Buton_ile_LED_Degistirme(void){
-	if(button_pressed_flag == 1){
-			  button_pressed_flag = 0;
-			  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-		  }
-}
-
-void Pot_ile_Deger_Olcme(void){
-		  HAL_ADC_Start(&hadc1);
-		  HAL_ADC_PollForConversion(&hadc1, 100);
-
-		  adcValue = HAL_ADC_GetValue(&hadc1);
-
-		  if(adcValue < 2048){
-			  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, SET);
-		  }
-		  else if(adcValue >= 2048){
-			  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, RESET);
-		  }
-
-		  sprintf(msg, "ADC: %u\r\n", adcValue);
-		  HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
+    HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 }
 /* USER CODE END 4 */
 
@@ -245,7 +340,6 @@ void Pot_ile_Deger_Olcme(void){
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
@@ -255,7 +349,7 @@ void Error_Handler(void)
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
+  * where the assert_param error has occurred.
   * @param  file: pointer to the source file name
   * @param  line: assert_param error line source number
   * @retval None
@@ -263,8 +357,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
